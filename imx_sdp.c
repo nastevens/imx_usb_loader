@@ -259,6 +259,12 @@ void parse_file_work(struct sdp_work *curr, const char *filename, const char *p)
 			curr->clear_dcd = 1;
 //			printf("clear_dcd\n");
 		}
+		if (strncmp(p, "send_dcd", 8) == 0) {
+			p += 8;
+			curr->send_dcd = 1;
+			curr->dcd_addr = get_val(&p, 16);
+			p = skip(p, ',');
+		}
 		if (strncmp(p, "no_clear_boot_data", 18) == 0) {
 			p += 18;
 			p = skip(p,',');
@@ -490,6 +496,8 @@ void print_sdp_work(struct sdp_work *curr)
 	printf("load_size %d bytes\n", curr->load_size);
 	printf("load_addr 0x%08x\n", curr->load_addr);
 	printf("dcd %u\n", curr->dcd);
+	printf("send_dcd %u\n", curr->send_dcd);
+	printf("dcd_addr %08x\n", curr->dcd_addr);
 	printf("clear_dcd %u\n", curr->clear_dcd);
 	printf("plug %u\n", curr->plug);
 	printf("jump_mode %d\n", curr->jump_mode);
@@ -786,6 +794,132 @@ static int write_dcd_table_ivt(struct sdp_dev *dev, struct ivt_header *hdr, unsi
 	return err;
 }
 
+int send_dcd(struct sdp_dev *dev, unsigned char *dcd_start, int cnt,
+	     unsigned dladdr)
+{
+	struct sdp_command dl_command = {
+		.cmd = SDP_WRITE_DCD,
+		.addr = BE32(dladdr),
+		.format = 0,
+		.cnt = BE32(cnt),
+		.data = 0,
+		.rsvd = 0};
+	unsigned int *status;
+	int last_trans, err;
+	int retry = 0;
+	unsigned transferSize=0;
+	int max = dev->max_transfer;
+	unsigned char tmp[64];
+	unsigned char *p = dcd_start;
+
+	for (;;) {
+		err = dev->transfer(dev, 1, (char *)&dl_command, sizeof(dl_command), 0, &last_trans);
+		if (!err)
+			break;
+		printf("dl_command err=%i, last_trans=%i\n", err, last_trans);
+		if (retry > 5)
+			return -4;
+		retry++;
+	}
+	retry = 0;
+	if (dev->mode == MODE_BULK) {
+		err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
+		if (err)
+			printf("in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
+	}
+
+	while (cnt) {
+		err = dev->transfer(dev, 2, p, get_min(cnt, max), 0, &last_trans);
+//			printf("err=%i, last_trans=0x%x, cnt=0x%x, max=0x%x\n", err, last_trans, cnt, max);
+		if (err) {
+			printf("out err=%i, last_trans=%i cnt=0x%x max=0x%x transferSize=0x%X retry=%i\n", err, last_trans, cnt, max, transferSize, retry);
+			if (retry >= 10) {
+				printf("Giving up\n");
+				return err;
+			}
+			if (max >= 16)
+				max >>= 1;
+			else
+				max <<= 1;
+			usleep(10000);
+			retry++;
+			continue;
+		}
+		max = dev->max_transfer;
+		retry = 0;
+		if (cnt < last_trans) {
+			printf("error: last_trans=0x%x, attempted only=0%x\n", last_trans, cnt);
+			cnt = last_trans;
+		}
+		if (!last_trans) {
+			printf("Nothing last_trans, err=%i\n", err);
+			break;
+		}
+		p += last_trans;
+		cnt -= last_trans;
+		transferSize += last_trans;
+	}
+
+	printf("\r\n<<<%i, %i bytes>>>\r\n", cnt, transferSize);
+	if (dev->mode == MODE_HID) {
+		err = dev->transfer(dev, 3, tmp, sizeof(tmp), 4, &last_trans);
+		if (err)
+			printf("report 3 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
+		err = dev->transfer(dev, 4, tmp, sizeof(tmp), 4, &last_trans);
+		if (err)
+			printf("report 4 in err=%i, last_trans=%i  %02x %02x %02x %02x\n", err, last_trans, tmp[0], tmp[1], tmp[2], tmp[3]);
+		status = (unsigned int*)tmp;
+		if (*status == 0x128A8A12UL)
+			printf("succeeded (status 0x%08x)\n", *status);
+		else
+			printf("failed (status 0x%08x)\n", *status);
+	} else {
+		do_status(dev);
+	}
+	return transferSize;
+}
+
+
+static int send_dcd_table_ivt(struct sdp_dev *dev, struct ivt_header *hdr,
+			      unsigned char *file_start, unsigned cnt,
+			      unsigned dladdr)
+{
+	unsigned char *dcd_end;
+	unsigned m_length;
+#define cvt_dest_to_src		(((unsigned char *)hdr) - hdr->self_ptr)
+	unsigned char* dcd;
+	unsigned char* file_end = file_start + cnt;
+	int err = 0;
+	int ret;
+	if (!hdr->dcd_ptr) {
+		printf("No dcd table, barker=%x\n", hdr->barker);
+		return 0;	//nothing to do
+	}
+	dcd = hdr->dcd_ptr + cvt_dest_to_src;
+	if ((dcd < file_start) || ((dcd + 4) > file_end)) {
+		printf("bad dcd_ptr %08x\n", hdr->dcd_ptr);
+		return -1;
+	}
+	m_length = (dcd[1] << 8) + dcd[2];
+	printf("main dcd length %x\n", m_length);
+	if ((dcd[0] != 0xd2) || (dcd[3] != 0x40)) {
+		printf("Unknown tag\n");
+		return -1;
+	}
+	dcd_end = dcd + m_length;
+	if (dcd_end > file_end) {
+		printf("bad dcd length %08x\n", m_length);
+		return -1;
+	}
+
+	printf("\nloading DCD to 0x%08x, length=0x%x\r\n", dladdr, m_length);
+	ret = send_dcd(dev, dcd, m_length, dladdr);
+	if (ret < 0)
+		return ret;
+
+	return 0;
+}
+
 static int get_dcd_range_old(struct old_app_header *hdr,
 		unsigned char *file_start, unsigned cnt,
 		unsigned char **pstart, unsigned char **pend)
@@ -1073,6 +1207,29 @@ int perform_dcd(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start
 	return 0;
 }
 
+int perform_dcd_send(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start, unsigned cnt, unsigned dladdr)
+{
+    int ret = 0;
+    switch (dev->header_type) {
+        case HDR_MX51:
+        {
+            //TODO
+            break;
+        }
+        case HDR_MX53:
+        {
+            struct ivt_header *hdr = (struct ivt_header *)p;
+            ret = send_dcd_table_ivt(dev, hdr, file_start, cnt, dladdr);
+            dbg_printf("dcd_ptr=0x%08x\n", hdr->dcd_ptr);
+            hdr->dcd_ptr = 0;
+            if (ret < 0)
+                return ret;
+            break;
+        }
+    }
+    return 0;
+}
+
 int clear_dcd_ptr(struct sdp_dev *dev, unsigned char *p, unsigned char *file_start, unsigned cnt)
 {
 	int ret = 0;
@@ -1221,6 +1378,17 @@ int process_header(struct sdp_dev *dev, struct sdp_work *curr,
 					return 0;
 				}
 			}
+            if (curr->send_dcd) {
+                ret = perform_dcd_send(dev, p, buf, cnt, curr->dcd_addr);
+                if (ret < 0) {
+                    printf("!!perform_dcd_send returned %i\n", ret);
+                    return ret;
+                }
+                if ((!curr->jump_mode) && (!curr->plug) && (!curr->clear_dcd)) {
+                    printf("!!dcd send done, nothing else requested\n");
+                    return ret;
+                }
+            }
 			if (curr->clear_dcd) {
 				ret = clear_dcd_ptr(dev, p, buf, cnt);
 				if (ret < 0) {
@@ -1410,7 +1578,7 @@ int DoIRomDownload(struct sdp_dev *dev, struct sdp_work *curr, int verify)
 		goto cleanup;
 	}
 	max_length = fsize;
-	if (curr->dcd || curr->clear_dcd || curr->plug || (curr->jump_mode >= J_HEADER)) {
+	if (curr->dcd || curr->clear_dcd || curr->send_dcd || curr->plug || (curr->jump_mode >= J_HEADER)) {
 		ret = process_header(dev, curr, buf, cnt,
 				&dladdr, &max_length, &plugin, &header_addr);
 		if (ret < 0)
